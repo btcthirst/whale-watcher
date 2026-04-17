@@ -1,0 +1,39 @@
+rpc:
+  endpoint: "wss://mainnet.helius-rpc.com"  # WebSocket endpoint
+  api_key: "${HELIUS_API_KEY}"               # Підтримка env vars
+  commitment: "confirmed"                    # processed | confirmed | finalized
+  rate_limit:
+    requests_per_second: 10
+    burst: 20
+
+whale_thresholds:
+  sol_lamports: 100000000000    # 100 SOL (1 SOL = 1_000_000_000 lamports)
+  usd_value: 10000              # $10,000 як альтернативний поріг
+  token_transfers: true         # Відстежувати SPL токени
+  known_whales:                 # Опціонально: список відомих китових адрес
+    - "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+    - "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+
+alerts:
+  console: true
+  webhook:
+    enabled: false
+    url: "${WEBHOOK_URL}"
+    headers:
+      Authorization: "Bearer ${WEBHOOK_TOKEN}"
+  log_file: "./logs/whale-watcher.log"
+  log_rotation:
+    max_size_mb: 100
+    max_backups: 5
+    compress: true
+
+storage:
+  enabled: true
+  sqlite_path: "./data/whales.db"
+  retention_days: 30
+
+monitoring:
+  accounts: []           # Конкретні адреси для моніторингу
+  programs: []           # Програми для відстеження (напр. Raydium, Jupiter)
+  exclude_programs:      # Виключити шумні програми
+    - "11111111111111111111111111111111"  # System Program (опціонально)
