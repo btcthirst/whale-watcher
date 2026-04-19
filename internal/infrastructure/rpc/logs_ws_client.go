@@ -11,7 +11,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type BlockWSClient struct {
+// LogsWSClient — WebSocket клієнт для logsSubscribe
+type LogsWSClient struct {
 	endpoint string
 	logger   *slog.Logger
 
@@ -21,16 +22,17 @@ type BlockWSClient struct {
 	writeMu sync.Mutex
 }
 
-func NewBlockWSClient(endpoint string, logger *slog.Logger) *BlockWSClient {
+// NewLogsWSClient створює клієнт підписки на логи
+func NewLogsWSClient(endpoint string, logger *slog.Logger) *LogsWSClient {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &BlockWSClient{endpoint: endpoint, logger: logger}
+	return &LogsWSClient{endpoint: endpoint, logger: logger}
 }
 
-func (c *BlockWSClient) Run(ctx context.Context, handler func([]byte)) error {
+// Run — нескінченний цикл з авто-реконнектом; зупиняється при ctx.Done()
+func (c *LogsWSClient) Run(ctx context.Context, handler func([]byte)) error {
 	for {
-		// stop immediately if context is done
 		select {
 		case <-ctx.Done():
 			c.close()
@@ -39,7 +41,6 @@ func (c *BlockWSClient) Run(ctx context.Context, handler func([]byte)) error {
 		}
 
 		if err := c.connect(ctx); err != nil {
-			// wait 2 s before retry, but wake up instantly on cancel
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -48,7 +49,7 @@ func (c *BlockWSClient) Run(ctx context.Context, handler func([]byte)) error {
 			continue
 		}
 
-		if err := c.subscribeBlocks(); err != nil {
+		if err := c.subscribeLogs(); err != nil {
 			c.close()
 			continue
 		}
@@ -59,7 +60,7 @@ func (c *BlockWSClient) Run(ctx context.Context, handler func([]byte)) error {
 	}
 }
 
-func (c *BlockWSClient) connect(ctx context.Context) error {
+func (c *LogsWSClient) connect(ctx context.Context) error {
 	u, err := url.Parse(c.endpoint)
 	if err != nil {
 		return err
@@ -80,31 +81,33 @@ func (c *BlockWSClient) connect(ctx context.Context) error {
 	c.connMu.Unlock()
 
 	c.setupHandlers(conn)
-
 	return nil
 }
 
-func (c *BlockWSClient) subscribeBlocks() error {
+// subscribeLogs підписується на всі лог-нотифікації
+func (c *LogsWSClient) subscribeLogs() error {
 	req := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
-		"method":  "blockSubscribe",
+		"method":  "logsSubscribe",
 		"params": []any{
-			map[string]any{},
-			map[string]any{
-				"encoding":           "jsonParsed",
-				"transactionDetails": "full",
-			},
+			"all",
+			map[string]any{"commitment": "confirmed"},
 		},
 	}
 
-	c.logger.Info("subscribing to block notifications")
-
+	c.logger.Info("subscribing to logs notifications")
 	return c.sendJSON(req)
 }
 
-func (c *BlockWSClient) readLoop(ctx context.Context, handler func([]byte)) error {
+func (c *LogsWSClient) readLoop(ctx context.Context, handler func([]byte)) error {
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		conn := c.getConn()
 		if conn == nil {
 			return errors.New("no connection")
@@ -116,13 +119,12 @@ func (c *BlockWSClient) readLoop(ctx context.Context, handler func([]byte)) erro
 			return err
 		}
 
-		c.logger.Debug("block message received", "bytes", len(msg))
-
+		c.logger.Debug("logs message received", "bytes", len(msg))
 		handler(msg)
 	}
 }
 
-func (c *BlockWSClient) sendJSON(v any) error {
+func (c *LogsWSClient) sendJSON(v any) error {
 	conn := c.getConn()
 	if conn == nil {
 		return errors.New("no connection")
@@ -131,24 +133,22 @@ func (c *BlockWSClient) sendJSON(v any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	c.logger.Debug("sending WS request")
-
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	return conn.WriteJSON(v)
 }
 
-func (c *BlockWSClient) setupHandlers(conn *websocket.Conn) {
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+func (c *LogsWSClient) setupHandlers(conn *websocket.Conn) {
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
 
 	go c.pingLoop(conn)
 }
 
-func (c *BlockWSClient) pingLoop(conn *websocket.Conn) {
+func (c *LogsWSClient) pingLoop(conn *websocket.Conn) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
@@ -163,13 +163,13 @@ func (c *BlockWSClient) pingLoop(conn *websocket.Conn) {
 	}
 }
 
-func (c *BlockWSClient) getConn() *websocket.Conn {
+func (c *LogsWSClient) getConn() *websocket.Conn {
 	c.connMu.RLock()
 	defer c.connMu.RUnlock()
 	return c.conn
 }
 
-func (c *BlockWSClient) close() {
+func (c *LogsWSClient) close() {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 

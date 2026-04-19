@@ -11,19 +11,21 @@ import (
 type Detector struct {
 	pricer *pricer.Pricer
 
-	solThreshold float64
-	usdThreshold float64
+	solThreshold         float64 // мін. кількість SOL для тригера
+	usdThreshold         float64 // мін. USD вартість SOL-трансферу для тригера
+	tokenAmountThreshold float64 // мін. кількість токен-одиниць для тригера
 }
 
-func NewDetector(p *pricer.Pricer, solThreshold, usdThreshold float64) *Detector {
+func NewDetector(p *pricer.Pricer, solThreshold, usdThreshold, tokenAmountThreshold float64) *Detector {
 	return &Detector{
-		pricer:       p,
-		solThreshold: solThreshold,
-		usdThreshold: usdThreshold,
+		pricer:               p,
+		solThreshold:         solThreshold,
+		usdThreshold:         usdThreshold,
+		tokenAmountThreshold: tokenAmountThreshold,
 	}
 }
 
-// Detect — повертає whale events
+// Detect — повертає whale events, розрізняючи SOL і TOKEN пороги
 func (d *Detector) Detect(ctx context.Context, transfers []domain.Transfer) ([]domain.WhaleEvent, error) {
 	if len(transfers) == 0 {
 		return nil, nil
@@ -34,7 +36,7 @@ func (d *Detector) Detect(ctx context.Context, transfers []domain.Transfer) ([]d
 		return nil, err
 	}
 
-	// агрегація по signature + token
+	// агрегація по signature + mint + type
 	agg := make(map[string]*domain.WhaleEvent)
 
 	for _, t := range transfers {
@@ -55,17 +57,23 @@ func (d *Detector) Detect(ctx context.Context, transfers []domain.Transfer) ([]d
 	var result []domain.WhaleEvent
 
 	for _, e := range agg {
-		// USD оцінка
-		if e.Type == "SOL" {
-			e.TotalUSD = e.TotalAmount * solPrice
-		} else {
-			// поки тільки SOL має USD
-			e.TotalUSD = 0
-		}
+		switch e.Type {
 
-		// threshold check
-		if e.TotalAmount >= d.solThreshold || e.TotalUSD >= d.usdThreshold {
-			result = append(result, *e)
+		case "SOL":
+			// USD оцінка на основі поточної ціни SOL
+			e.TotalUSD = e.TotalAmount * solPrice
+
+			// тригер: достатньо SOL по кількості АБО по USD вартості
+			if e.TotalAmount >= d.solThreshold || e.TotalUSD >= d.usdThreshold {
+				result = append(result, *e)
+			}
+
+		case "TOKEN":
+			// USD оцінка токенів наразі недоступна — TotalUSD = 0
+			// тригер: тільки за кількістю токен-одиниць
+			if e.TotalAmount >= d.tokenAmountThreshold {
+				result = append(result, *e)
+			}
 		}
 	}
 

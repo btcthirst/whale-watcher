@@ -20,6 +20,7 @@ func (r *Repository) InsertTransfers(transfers []domain.Transfer) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO transfers(signature, slot, type, from_addr, to_addr, mint, amount)
@@ -54,6 +55,7 @@ func (r *Repository) InsertWhaleEvents(events []domain.WhaleEvent) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO whale_events(signature, slot, type, token, total_amount, total_usd)

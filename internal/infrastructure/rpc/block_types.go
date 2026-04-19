@@ -1,3 +1,4 @@
+// Package rpc Solana RPC types
 package rpc
 
 type BlockNotification struct {

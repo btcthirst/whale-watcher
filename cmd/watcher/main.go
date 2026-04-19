@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	alertapp "github.com/btcthirst/whale-watcher/internal/application/alert"
@@ -20,10 +20,12 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
-
 	// logger
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	// graceful shutdown context: cancelled on SIGINT / SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// config
 	cfg, err := config.Load()
@@ -32,12 +34,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	logger.Info("whale watcher starting",
+		"sol_threshold", cfg.SolThreshold,
+		"usd_threshold", cfg.USDThreshold,
+		"token_amount_threshold", cfg.TokenAmountThreshold,
+	)
+
 	// DB
 	db, err := sqlite.NewDB(cfg.DBPath)
 	if err != nil {
 		logger.Error("db init failed", "error", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			logger.Error("db close failed", "error", err)
+		}
+	}()
 
 	if err := sqlite.Migrate(db); err != nil {
 		logger.Error("db migrate failed", "error", err)
@@ -47,11 +60,12 @@ func main() {
 	repo := sqlite.NewRepository(db)
 
 	// core services
-	wsClient := rpc.NewBlockWSClient(cfg.SolanaWSEndpoint())
-	blockParser := parser.NewBlockParser()
+	wsClient := rpc.NewLogsWSClient(cfg.SolanaWSEndpoint(), logger)
+	helius := rpc.NewHeliusClient(cfg.HeliusAPIKey)
+	enhancedParser := parser.NewEnhancedParser()
 	deduper := dedup.NewDeduper(2 * time.Minute)
 	pr := pricer.NewPricer(30 * time.Second)
-	detector := whale.NewDetector(pr, 100, 50000)
+	detector := whale.NewDetector(pr, cfg.SolThreshold, cfg.USDThreshold, cfg.TokenAmountThreshold)
 
 	// alerts
 	var senders []alertapp.Sender
@@ -71,23 +85,28 @@ func main() {
 	alerts := alertapp.NewService(1000, senders...)
 	alerts.Start(ctx, 5)
 
-	// handler
+	// handler: отримує raw WS-повідомлення logsNotification
 	handler := func(msg []byte) {
-		var block rpc.BlockNotification
-		fmt.Println("RAW:", string(msg))
+		// parse logsNotification → signature
+		notification, err := rpc.ParseLogs(msg)
+		if err != nil || notification == nil {
+			return // не logsNotification або помилка парсингу
+		}
 
-		if err := json.Unmarshal(msg, &block); err != nil {
-			logger.Error("json parse error", "error", err)
+		sig := notification.Params.Result.Value.Signature
+		if sig == "" {
 			return
 		}
 
-		slot := block.Params.Result.Context.Slot
+		// збагачуємо через Helius Enhanced API
+		txs, err := helius.GetTransactions(ctx, []string{sig})
+		if err != nil {
+			logger.Error("helius fetch failed", "signature", sig, "error", err)
+			return
+		}
 
-		for _, tx := range block.Params.Result.Value.Block.Transactions {
-
-			sig := getSignature(tx)
-
-			transfers := blockParser.ParseBlock(tx, slot)
+		for _, tx := range txs {
+			transfers := enhancedParser.Parse(tx)
 			if len(transfers) == 0 {
 				continue
 			}
@@ -127,26 +146,20 @@ func main() {
 			for _, e := range events {
 				alerts.Notify(e)
 
-				fmt.Printf("🐋 %s %.2f $%.2f\n",
-					e.Type,
-					e.TotalAmount,
-					e.TotalUSD,
+				logger.Info("🐋 whale event detected",
+					"type", e.Type,
+					"amount", e.TotalAmount,
+					"usd", e.TotalUSD,
+					"signature", e.Signature,
 				)
 			}
 		}
 	}
 
-	// run WS client
+	// run WS client (blocks until ctx is cancelled or fatal error)
 	if err := wsClient.Run(ctx, handler); err != nil {
 		logger.Error("ws client stopped", "error", err)
-		os.Exit(1)
 	}
-}
 
-// helper
-func getSignature(tx rpc.BlockTransaction) string {
-	if len(tx.Transaction.Signatures) > 0 {
-		return tx.Transaction.Signatures[0]
-	}
-	return "unknown"
+	logger.Info("shutdown complete")
 }
