@@ -1,3 +1,4 @@
+// Package dedup provides transfer deduplication logic.
 package dedup
 
 import (

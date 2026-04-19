@@ -1,7 +1,54 @@
-.env
-node_modules
-.vscode
+# Binaries and compiled files
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace and cache
+go.work
+go.work.sum
+/vendor/
+
+# Test output and coverage
+coverage.out
+coverage.html
+c.out
+
+# Database files
 *.db
-*.log
 *.db-wal
 *.db-shm
+/data/
+
+# Environment and Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Logs
+*.log
+/logs/
+
+# IDE and Editor folders
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Node.js (just in case there are frontend scripts)
+node_modules/

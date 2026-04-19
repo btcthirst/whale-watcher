@@ -4,13 +4,20 @@ package whale
 import (
 	"context"
 
-	"github.com/btcthirst/whale-watcher/internal/application/pricer"
 	"github.com/btcthirst/whale-watcher/internal/domain"
 )
 
+type SOLPricer interface {
+	GetSOLPriceUSD(ctx context.Context) (float64, error)
+}
+
+type TokenPricer interface {
+	GetTokenPricesUSD(ctx context.Context, mints []string) (map[string]float64, map[string]string)
+}
+
 type Detector struct {
-	solPricer   *pricer.Pricer
-	tokenPricer *pricer.MultiPricer
+	solPricer   SOLPricer
+	tokenPricer TokenPricer
 
 	solThreshold         float64
 	usdThreshold         float64
@@ -18,8 +25,8 @@ type Detector struct {
 }
 
 func NewDetector(
-	sp *pricer.Pricer,
-	tp *pricer.MultiPricer,
+	sp SOLPricer,
+	tp TokenPricer,
 	solThreshold, usdThreshold, tokenAmountThreshold float64,
 ) *Detector {
 	return &Detector{

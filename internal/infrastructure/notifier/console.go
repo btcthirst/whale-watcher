@@ -29,7 +29,7 @@ func (c *ConsoleAlert) Send(alert *domain.WhaleAlert) error {
 	fmt.Printf("⚙ Program:    %s\n", alert.ProgramID.String())
 	fmt.Printf("📦 Slot:       %d\n", alert.Slot)
 	fmt.Printf("🔒 Commitment: %s\n", alert.Commitment)
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	return nil
 }
 
