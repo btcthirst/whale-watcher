@@ -9,47 +9,45 @@ import (
 )
 
 type Detector struct {
-	pricer        *pricer.Pricer
-	jupiterPricer *pricer.JupiterPricer
+	solPricer   *pricer.Pricer
+	tokenPricer *pricer.MultiPricer
 
-	solThreshold         float64 // мін. кількість SOL для тригера
-	usdThreshold         float64 // мін. USD вартість для тригера (SOL і TOKEN)
-	tokenAmountThreshold float64 // fallback поріг за кількістю токенів якщо ціна невідома
+	solThreshold         float64
+	usdThreshold         float64
+	tokenAmountThreshold float64 // fallback якщо жодне джерело не знає ціну
 }
 
 func NewDetector(
-	p *pricer.Pricer,
-	jp *pricer.JupiterPricer,
+	sp *pricer.Pricer,
+	tp *pricer.MultiPricer,
 	solThreshold, usdThreshold, tokenAmountThreshold float64,
 ) *Detector {
 	return &Detector{
-		pricer:               p,
-		jupiterPricer:        jp,
+		solPricer:            sp,
+		tokenPricer:          tp,
 		solThreshold:         solThreshold,
 		usdThreshold:         usdThreshold,
 		tokenAmountThreshold: tokenAmountThreshold,
 	}
 }
 
-// Detect — повертає whale events, розрізняючи SOL і TOKEN пороги.
-// Для TOKEN: якщо Jupiter знає ціну → перевіряємо USD поріг (PriceSourceJupiter);
-// якщо ціна невідома → fallback на tokenAmountThreshold (PriceSourceFallback).
+// Detect — повертає whale events.
+// SOL: порівнює з solThreshold (кількість) або usdThreshold (вартість).
+// TOKEN: якщо MultiPricer знає ціну → usdThreshold; інакше → tokenAmountThreshold.
 func (d *Detector) Detect(ctx context.Context, transfers []domain.Transfer) ([]domain.WhaleEvent, error) {
 	if len(transfers) == 0 {
 		return nil, nil
 	}
 
-	solPrice, err := d.pricer.GetSOLPriceUSD(ctx)
+	solPrice, err := d.solPricer.GetSOLPriceUSD(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	// агрегація по signature + mint + type
 	agg := make(map[string]*domain.WhaleEvent)
-
 	for _, t := range transfers {
 		key := t.Signature + "|" + t.Mint + "|" + string(t.Type)
-
 		if _, ok := agg[key]; !ok {
 			agg[key] = &domain.WhaleEvent{
 				Signature: t.Signature,
@@ -58,11 +56,10 @@ func (d *Detector) Detect(ctx context.Context, transfers []domain.Transfer) ([]d
 				Token:     t.Mint,
 			}
 		}
-
 		agg[key].TotalAmount += t.Amount
 	}
 
-	// збираємо унікальні mint-адреси TOKEN-подій для батч-запиту до Jupiter
+	// збираємо унікальні mint для TOKEN-подій
 	var tokenMints []string
 	seen := make(map[string]bool)
 	for _, e := range agg {
@@ -72,14 +69,12 @@ func (d *Detector) Detect(ctx context.Context, transfers []domain.Transfer) ([]d
 		}
 	}
 
-	// отримуємо ціни токенів одним батч-запитом
+	// батч-запит до MultiPricer (Jupiter → DexScreener → GeckoTerminal)
 	tokenPrices := make(map[string]float64)
+	tokenSources := make(map[string]string)
 	if len(tokenMints) > 0 {
-		prices, err := d.jupiterPricer.GetTokenPricesUSD(ctx, tokenMints)
-		if err == nil {
-			tokenPrices = prices
-		}
-		// при помилці Jupiter — деградуємо до fallback, не фатально
+		tokenPrices, tokenSources = d.tokenPricer.GetTokenPricesUSD(ctx, tokenMints)
+		// помилки не фатальні — деградуємо до fallback
 	}
 
 	var result []domain.WhaleEvent
@@ -89,24 +84,23 @@ func (d *Detector) Detect(ctx context.Context, transfers []domain.Transfer) ([]d
 
 		case "SOL":
 			e.TotalUSD = e.TotalAmount * solPrice
-			e.PriceSource = domain.PriceSourceSOL
+			e.PriceSource = "coingecko"
 
 			if e.TotalAmount >= d.solThreshold || e.TotalUSD >= d.usdThreshold {
 				result = append(result, *e)
 			}
 
 		case "TOKEN":
-			if tokenPrice, ok := tokenPrices[e.Token]; ok {
-				// Jupiter знає ціну → точна USD оцінка
-				e.TotalUSD = e.TotalAmount * tokenPrice
-				e.PriceSource = domain.PriceSourceJupiter
+			if price, ok := tokenPrices[e.Token]; ok && price > 0 {
+				e.TotalUSD = e.TotalAmount * price
+				e.PriceSource = tokenSources[e.Token]
 
 				if e.TotalUSD >= d.usdThreshold {
 					result = append(result, *e)
 				}
 			} else {
-				// невідомий токен → fallback за кількістю одиниць
-				e.PriceSource = domain.PriceSourceFallback
+				// жодне джерело не знає ціну → fallback за кількістю
+				e.PriceSource = "fallback"
 
 				if e.TotalAmount >= d.tokenAmountThreshold {
 					result = append(result, *e)

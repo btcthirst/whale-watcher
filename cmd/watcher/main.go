@@ -22,14 +22,11 @@ import (
 )
 
 func main() {
-	// logger
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	// graceful shutdown context: cancelled on SIGINT / SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// config
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Error("config load failed", "error", err)
@@ -42,7 +39,6 @@ func main() {
 		"token_amount_threshold", cfg.TokenAmountThreshold,
 	)
 
-	// DB
 	db, err := sqlite.NewDB(cfg.DBPath)
 	if err != nil {
 		logger.Error("db init failed", "error", err)
@@ -61,36 +57,35 @@ func main() {
 
 	repo := sqlite.NewRepository(db)
 
-	// core services
 	wsClient := rpc.NewLogsWSClient(cfg.SolanaWSEndpoint(), logger)
 	helius := rpc.NewHeliusClient(cfg.HeliusAPIKey)
 	enhancedParser := parser.NewEnhancedParser()
 	deduper := dedup.NewDeduper(2 * time.Minute)
 
-	pr := pricer.NewPricer(30 * time.Second)
-	jp := pricer.NewJupiterPricer(30 * time.Second)
+	solPricer := pricer.NewPricer(30 * time.Second)
 
-	detector := whale.NewDetector(pr, jp, cfg.SolThreshold, cfg.USDThreshold, cfg.TokenAmountThreshold)
+	// ланцюг джерел ціни токенів: Jupiter → DexScreener → GeckoTerminal
+	// перше джерело що знає ціну виграє; результати кешуються 30 секунд
+	tokenPricer := pricer.NewMultiPricer(
+		30*time.Second,
+		pricer.NewJupiterPricer(),
+		pricer.NewDexScreenerPricer(),
+		pricer.NewGeckoTerminalPricer(),
+	)
 
-	// alerts
+	detector := whale.NewDetector(solPricer, tokenPricer, cfg.SolThreshold, cfg.USDThreshold, cfg.TokenAmountThreshold)
+
 	var senders []alertapp.Sender
-
 	if cfg.TelegramToken != "" && cfg.TelegramChatID != "" {
-		senders = append(senders,
-			alertinfra.NewTelegramSender(cfg.TelegramToken, cfg.TelegramChatID),
-		)
+		senders = append(senders, alertinfra.NewTelegramSender(cfg.TelegramToken, cfg.TelegramChatID))
 	}
-
 	if cfg.WebhookURL != "" {
-		senders = append(senders,
-			alertinfra.NewWebhookSender(cfg.WebhookURL),
-		)
+		senders = append(senders, alertinfra.NewWebhookSender(cfg.WebhookURL))
 	}
 
 	alerts := alertapp.NewService(1000, senders...)
 	alerts.Start(ctx, 5)
 
-	// handler: отримує raw WS-повідомлення logsNotification
 	handler := func(msg []byte) {
 		notification, err := rpc.ParseLogs(msg)
 		if err != nil || notification == nil {
@@ -154,8 +149,8 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-// logWhaleEvent логує подію з урахуванням джерела ціни:
-// fallback-події (невідома ціна токена) — рівень DEBUG щоб не засмічувати INFO.
+// logWhaleEvent логує подію з урахуванням джерела ціни.
+// fallback-події — рівень WARN: токен є, але ціна невідома жодному джерелу.
 func logWhaleEvent(logger *slog.Logger, e domain.WhaleEvent) {
 	args := []any{
 		"type", e.Type,
@@ -169,10 +164,8 @@ func logWhaleEvent(logger *slog.Logger, e domain.WhaleEvent) {
 		args = append(args, "mint", e.Token)
 	}
 
-	if e.PriceSource == domain.PriceSourceFallback {
-		// невідомий токен — спрацював amount threshold, не USD
-		// логуємо як DEBUG щоб не засмічувати INFO потік
-		logger.Debug("🐋 whale event detected (unverified price)", args...)
+	if e.PriceSource == "fallback" {
+		logger.Warn("🐋 whale event detected (price unknown)", args...)
 		return
 	}
 
