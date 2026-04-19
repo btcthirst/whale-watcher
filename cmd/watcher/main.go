@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 	"github.com/btcthirst/whale-watcher/internal/application/pricer"
 	"github.com/btcthirst/whale-watcher/internal/application/whale"
 	"github.com/btcthirst/whale-watcher/internal/config"
+	"github.com/btcthirst/whale-watcher/internal/domain"
 	alertinfra "github.com/btcthirst/whale-watcher/internal/infrastructure/alert"
 	"github.com/btcthirst/whale-watcher/internal/infrastructure/rpc"
 	"github.com/btcthirst/whale-watcher/internal/storage/sqlite"
@@ -64,8 +66,11 @@ func main() {
 	helius := rpc.NewHeliusClient(cfg.HeliusAPIKey)
 	enhancedParser := parser.NewEnhancedParser()
 	deduper := dedup.NewDeduper(2 * time.Minute)
+
 	pr := pricer.NewPricer(30 * time.Second)
-	detector := whale.NewDetector(pr, cfg.SolThreshold, cfg.USDThreshold, cfg.TokenAmountThreshold)
+	jp := pricer.NewJupiterPricer(30 * time.Second)
+
+	detector := whale.NewDetector(pr, jp, cfg.SolThreshold, cfg.USDThreshold, cfg.TokenAmountThreshold)
 
 	// alerts
 	var senders []alertapp.Sender
@@ -87,10 +92,9 @@ func main() {
 
 	// handler: отримує raw WS-повідомлення logsNotification
 	handler := func(msg []byte) {
-		// parse logsNotification → signature
 		notification, err := rpc.ParseLogs(msg)
 		if err != nil || notification == nil {
-			return // не logsNotification або помилка парсингу
+			return
 		}
 
 		sig := notification.Params.Result.Value.Signature
@@ -98,9 +102,11 @@ func main() {
 			return
 		}
 
-		// збагачуємо через Helius Enhanced API
 		txs, err := helius.GetTransactions(ctx, []string{sig})
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			logger.Error("helius fetch failed", "signature", sig, "error", err)
 			return
 		}
@@ -113,20 +119,16 @@ func main() {
 
 			transfers = deduper.DedupTransfers(transfers)
 
-			// storage: transfers
 			if err := repo.InsertTransfers(transfers); err != nil {
-				logger.Error("insert transfers failed",
-					"signature", sig,
-					"error", err,
-				)
+				logger.Error("insert transfers failed", "signature", sig, "error", err)
 			}
 
 			events, err := detector.Detect(ctx, transfers)
 			if err != nil {
-				logger.Error("whale detect failed",
-					"signature", sig,
-					"error", err,
-				)
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				logger.Error("whale detect failed", "signature", sig, "error", err)
 				continue
 			}
 
@@ -134,32 +136,45 @@ func main() {
 				continue
 			}
 
-			// storage: whale events
 			if err := repo.InsertWhaleEvents(events); err != nil {
-				logger.Error("insert whale events failed",
-					"signature", sig,
-					"error", err,
-				)
+				logger.Error("insert whale events failed", "signature", sig, "error", err)
 			}
 
-			// alerts
 			for _, e := range events {
 				alerts.Notify(e)
-
-				logger.Info("🐋 whale event detected",
-					"type", e.Type,
-					"amount", e.TotalAmount,
-					"usd", e.TotalUSD,
-					"signature", e.Signature,
-				)
+				logWhaleEvent(logger, e)
 			}
 		}
 	}
 
-	// run WS client (blocks until ctx is cancelled or fatal error)
-	if err := wsClient.Run(ctx, handler); err != nil {
+	if err := wsClient.Run(ctx, handler); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("ws client stopped", "error", err)
 	}
 
 	logger.Info("shutdown complete")
+}
+
+// logWhaleEvent логує подію з урахуванням джерела ціни:
+// fallback-події (невідома ціна токена) — рівень DEBUG щоб не засмічувати INFO.
+func logWhaleEvent(logger *slog.Logger, e domain.WhaleEvent) {
+	args := []any{
+		"type", e.Type,
+		"amount", e.TotalAmount,
+		"usd", e.TotalUSD,
+		"price_source", e.PriceSource,
+		"signature", e.Signature,
+	}
+
+	if e.Type == "TOKEN" {
+		args = append(args, "mint", e.Token)
+	}
+
+	if e.PriceSource == domain.PriceSourceFallback {
+		// невідомий токен — спрацював amount threshold, не USD
+		// логуємо як DEBUG щоб не засмічувати INFO потік
+		logger.Debug("🐋 whale event detected (unverified price)", args...)
+		return
+	}
+
+	logger.Info("🐋 whale event detected", args...)
 }

@@ -11,6 +11,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	wsReadDeadline  = 60 * time.Second
+	wsPingInterval  = 15 * time.Second
+	wsWriteDeadline = 10 * time.Second
+	wsReconnectWait = 2 * time.Second
+)
+
 // LogsWSClient — WebSocket клієнт для logsSubscribe
 type LogsWSClient struct {
 	endpoint string
@@ -44,7 +51,7 @@ func (c *LogsWSClient) Run(ctx context.Context, handler func([]byte)) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(2 * time.Second):
+			case <-time.After(wsReconnectWait):
 			}
 			continue
 		}
@@ -119,6 +126,11 @@ func (c *LogsWSClient) readLoop(ctx context.Context, handler func([]byte)) error
 			return err
 		}
 
+		// скидаємо deadline після кожного успішно прочитаного повідомлення.
+		// без цього deadline спрацьовував через 60s незалежно від активності стріму,
+		// бо Helius WS proxy може не відповідати на ping.
+		conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+
 		c.logger.Debug("logs message received", "bytes", len(msg))
 		handler(msg)
 	}
@@ -133,15 +145,16 @@ func (c *LogsWSClient) sendJSON(v any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
 	return conn.WriteJSON(v)
 }
 
 func (c *LogsWSClient) setupHandlers(conn *websocket.Conn) {
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	// початковий deadline до першого повідомлення або pong
+	conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
 
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
 		return nil
 	})
 
@@ -149,7 +162,7 @@ func (c *LogsWSClient) setupHandlers(conn *websocket.Conn) {
 }
 
 func (c *LogsWSClient) pingLoop(conn *websocket.Conn) {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(wsPingInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
